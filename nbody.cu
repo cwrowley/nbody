@@ -57,20 +57,19 @@ void induced_vel_omp(const float2 *pos,
 __global__ void induced_vel_kernel(const float2 *pos,
                      const float2 *vort,
                      const float *gam,
-                     float2 *vel,
+                     float2 *vel_out,
                      const int N) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const float2 p = pos[i];
-  vel[i].x = 0;
-  vel[i].y = 0;
+  float2 vel = {0.,0.};
   for (int j = 0; j < N; ++j) {
     const float eps = 1.e-6;
     const float2 r = {p.x - vort[j].x, p.y - vort[j].y};
     float rsq = r.x * r.x + r.y * r.y + eps;
-    float2 v = {gam[j] * r.x / rsq, -gam[j] * r.y / rsq};
-    vel[i].x += v.x;
-    vel[i].y += v.y;
+    vel.x +=  gam[j] * r.x / rsq;
+    vel.y += -gam[j] * r.y / rsq;
   }
+  vel_out[i] = vel;
 }
 
 void induced_vel_gpu(const float2 *pos,
