@@ -1,5 +1,6 @@
 #include <omp.h>
 #include <stdio.h>
+#include <nvToolsExt.h>
 
 // Macro for checking cuda errors following a cuda launch or api call
 #define cudaCheckError() {                                       \
@@ -35,10 +36,10 @@ void induced_vel_reference(const float2 *pos,
 }
 
 void induced_vel_omp(const float2 *pos,
-                           const float2 *vort,
-                           const float *gam,
-                           float2 *vel,
-                           const int N) {
+                     const float2 *vort,
+                     const float *gam,
+                     float2 *vel,
+                     const int N) {
   // set number of threads with
   // export OMP_NUM_THREADS=6
   memset(vel, 0, N * sizeof(float2));
@@ -53,6 +54,37 @@ void induced_vel_omp(const float2 *pos,
   }
 }
 
+__global__ void induced_vel_kernel(const float2 *pos,
+                     const float2 *vort,
+                     const float *gam,
+                     float2 *vel,
+                     const int N) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const float2 p = pos[i];
+  vel[i].x = 0;
+  vel[i].y = 0;
+  for (int j = 0; j < N; ++j) {
+    const float eps = 1.e-6;
+    const float2 r = {p.x - vort[j].x, p.y - vort[j].y};
+    float rsq = r.x * r.x + r.y * r.y + eps;
+    float2 v = {gam[j] * r.x / rsq, -gam[j] * r.y / rsq};
+    vel[i].x += v.x;
+    vel[i].y += v.y;
+  }
+}
+
+void induced_vel_gpu(const float2 *pos,
+                     const float2 *vort,
+                     const float *gam,
+                     float2 *vel,
+                     const int N) {
+  dim3 threads(128);
+  dim3 blocks((N + threads.x - 1)/threads.x);
+  induced_vel_kernel<<<blocks, threads>>>(pos, vort, gam, vel, N);
+  cudaCheckError();
+}
+
+
 typedef void (*func_ptr)(const float2*, const float2*, const float*, float2*, const int);
 
 const int NUM_REPS = 1;
@@ -62,14 +94,19 @@ void time_induced_vel(const char *label,
                       const float2 *vort,
                       const float *gam,
                       float2 *vel,
-                      const int N) {
+                      const int N,
+                      bool cuda) {
   // warm up
   fptr(vort, vort, gam, vel, N);
 
+  if (cuda) cudaDeviceSynchronize();
   double start = omp_get_wtime();
+  nvtxRangePushA(label);
   for (int i = 0; i < NUM_REPS; ++i) {
     fptr(vort, vort, gam, vel, N);
   }
+  if (cuda) cudaDeviceSynchronize();
+  nvtxRangePop();
   double end = omp_get_wtime();
 
   // Check the answer: return time only if answer is correct.
@@ -77,7 +114,7 @@ void time_induced_vel(const char *label,
   induced_vel_reference(vort, vort, gam, validation, N);
   for (int i = 0; i < N; ++i) {
     if (vel[i].x != validation[i].x || vel[i].y != validation[i].y) {
-      printf("Error: velocity is incorrect at index %d\n", i);
+      printf("%s: Error: velocity is incorrect at index %d\n", label, i);
       return;
     }
   }
@@ -108,8 +145,9 @@ int main() {
   }
   memset(vel, 0, N * sizeof(float2));
 
-  time_induced_vel((char *)"CPU", induced_vel_reference, vort, gam, vel, N);
-  time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, gam, vel, N);
+  time_induced_vel((char *)"CPU", induced_vel_reference, vort, gam, vel, N, false);
+  time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, gam, vel, N, false);
+  time_induced_vel((char *)"GPU", induced_vel_gpu, vort, gam, vel, N, true);
 
   cudaFree(vort);
   cudaFree(vel);
