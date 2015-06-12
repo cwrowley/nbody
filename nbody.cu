@@ -16,7 +16,7 @@ inline float2 induced_velocity_single(float2 pos, float2 vort, float gam) {
   const float eps = 1.e-6;
   const float2 r = {pos.x - vort.x, pos.y - vort.y};
   float rsq = r.x * r.x + r.y * r.y + eps;
-  float2 vel = {gam * r.x / rsq, -gam * r.y / rsq};
+  float2 vel = {gam * r.y / rsq, -gam * r.x / rsq};
   return vel;
 }
 
@@ -25,7 +25,7 @@ void induced_vel_reference(const float2 *pos,
                            const float *gam,
                            float2 *vel,
                            const int N) {
-  memset(vel, 0, N * sizeof(float2));
+  memset(vel, 0, N * sizeof(*vel));
   for (int i = 0; i < N; ++i) {   // i indexes position
     for (int j = 0; j < N; ++j) { // j indexes vortices
       float2 v = induced_velocity_single(pos[i], vort[j], gam[j]);
@@ -42,7 +42,7 @@ void induced_vel_omp(const float2 *pos,
                      const int N) {
   // set number of threads with
   // export OMP_NUM_THREADS=6
-  memset(vel, 0, N * sizeof(float2));
+  memset(vel, 0, N * sizeof(*vel));
   #pragma omp parallel for
   for (int i = 0; i < N; ++i) {   // i indexes position
     #pragma omp parallel for
@@ -65,9 +65,9 @@ __global__ void induced_vel_kernel(const float2 *pos,
   for (int j = 0; j < N; ++j) {
     const float eps = 1.e-6;
     const float2 r = {p.x - vort[j].x, p.y - vort[j].y};
-    float rsq = r.x * r.x + r.y * r.y + eps;
-    vel.x +=  gam[j] * r.x / rsq;
-    vel.y += -gam[j] * r.y / rsq;
+    float fac = gam[j] / (r.x * r.x + r.y * r.y + eps);
+    vel.x +=  r.y * fac;
+    vel.y += -r.x * fac;
   }
   vel_out[i] = vel;
 }
@@ -87,6 +87,12 @@ void induced_vel_gpu(const float2 *pos,
 typedef void (*func_ptr)(const float2*, const float2*, const float*, float2*, const int);
 
 const int NUM_REPS = 1;
+
+inline bool close(float2 a, float2 b) {
+  const float rel_tol = 1.e-6;
+  return fabs((a.x-b.x) * (a.x-b.x) + (a.y - b.y) * (a.y - b.y)) <
+    rel_tol * fabs(a.x * a.x + a.y * a.y);
+}
 
 void time_induced_vel(const char *label,
                       func_ptr fptr,
@@ -112,8 +118,10 @@ void time_induced_vel(const char *label,
   float2 *validation = (float2 *) malloc(N * sizeof(float2));
   induced_vel_reference(vort, vort, gam, validation, N);
   for (int i = 0; i < N; ++i) {
-    if (vel[i].x != validation[i].x || vel[i].y != validation[i].y) {
+    if (!close(vel[i], validation[i])) {
       printf("%s: Error: velocity is incorrect at index %d\n", label, i);
+      printf("  expected (%f, %f)\n       got (%f, %f)\n",
+             validation[i].x, validation[i].y, vel[i].x, vel[i].y);
       return;
     }
   }
@@ -131,9 +139,9 @@ int main() {
   float2 *vel = NULL;
   float *gam = NULL;
 
-  cudaMallocManaged(&vort, N * sizeof(float2));
-  cudaMallocManaged(&vel, N * sizeof(float2));
-  cudaMallocManaged(&gam, N * sizeof(float));
+  cudaMallocManaged(&vort, N * sizeof(*vort));
+  cudaMallocManaged(&vel, N * sizeof(*vel));
+  cudaMallocManaged(&gam, N * sizeof(*gam));
   cudaCheckError();
 
   // initialize vortex positions and strengths to random values
