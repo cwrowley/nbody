@@ -12,23 +12,23 @@
  }                                                               \
 }
 
-inline float2 induced_velocity_single(float2 pos, float2 vort, float gam) {
+inline float2 induced_velocity_single(float2 pos, float4 vort) {
+  // vortex strength is vort.z
   const float eps = 1.e-6;
   const float2 r = {pos.x - vort.x, pos.y - vort.y};
   float rsq = r.x * r.x + r.y * r.y + eps;
-  float2 vel = {gam * r.y / rsq, -gam * r.x / rsq};
+  float2 vel = {vort.z * r.y / rsq, -vort.z * r.x / rsq};
   return vel;
 }
 
 void induced_vel_reference(const float2 *pos,
-                           const float2 *vort,
-                           const float *gam,
+                           const float4 *vort,
                            float2 *vel,
                            const int N) {
   memset(vel, 0, N * sizeof(*vel));
   for (int i = 0; i < N; ++i) {   // i indexes position
     for (int j = 0; j < N; ++j) { // j indexes vortices
-      float2 v = induced_velocity_single(pos[i], vort[j], gam[j]);
+      float2 v = induced_velocity_single(pos[i], vort[j]);
       vel[i].x += v.x;
       vel[i].y += v.y;
     }
@@ -36,8 +36,7 @@ void induced_vel_reference(const float2 *pos,
 }
 
 void induced_vel_omp(const float2 *pos,
-                     const float2 *vort,
-                     const float *gam,
+                     const float4 *vort,
                      float2 *vel,
                      const int N) {
   // set number of threads with
@@ -47,7 +46,7 @@ void induced_vel_omp(const float2 *pos,
   for (int i = 0; i < N; ++i) {   // i indexes position
     #pragma omp parallel for
     for (int j = 0; j < N; ++j) { // j indexes vortices
-      float2 v = induced_velocity_single(pos[i], vort[j], gam[j]);
+      float2 v = induced_velocity_single(pos[i], vort[j]);
       vel[i].x += v.x;
       vel[i].y += v.y;
     }
@@ -55,8 +54,7 @@ void induced_vel_omp(const float2 *pos,
 }
 
 __global__ void induced_vel_kernel(const float2 *pos,
-                     const float2 *vort,
-                     const float *gam,
+                     const float4 *vort,
                      float2 *vel_out,
                      const int N) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,7 +63,7 @@ __global__ void induced_vel_kernel(const float2 *pos,
   for (int j = 0; j < N; ++j) {
     const float eps = 1.e-6;
     const float2 r = {p.x - vort[j].x, p.y - vort[j].y};
-    float fac = gam[j] / (r.x * r.x + r.y * r.y + eps);
+    float fac = vort[j].z / (r.x * r.x + r.y * r.y + eps);
     vel.x +=  r.y * fac;
     vel.y += -r.x * fac;
   }
@@ -73,18 +71,17 @@ __global__ void induced_vel_kernel(const float2 *pos,
 }
 
 void induced_vel_gpu(const float2 *pos,
-                     const float2 *vort,
-                     const float *gam,
+                     const float4 *vort,
                      float2 *vel,
                      const int N) {
   dim3 threads(128);
   dim3 blocks((N + threads.x - 1)/threads.x);
-  induced_vel_kernel<<<blocks, threads>>>(pos, vort, gam, vel, N);
+  induced_vel_kernel<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
 
 
-typedef void (*func_ptr)(const float2*, const float2*, const float*, float2*, const int);
+typedef void (*func_ptr)(const float2*, const float4*, float2*, const int);
 
 const int NUM_REPS = 1;
 
@@ -96,19 +93,26 @@ inline bool close(float2 a, float2 b) {
 
 void time_induced_vel(const char *label,
                       func_ptr fptr,
-                      const float2 *vort,
-                      const float *gam,
+                      const float4 *vort,
                       float2 *vel,
                       const int N,
                       bool cuda) {
   // warm up
-  fptr(vort, vort, gam, vel, N);
+  float2 *pos = NULL;
+  cudaMallocManaged(&pos, N * sizeof(*pos));
+  cudaCheckError();
+
+  for (int i = 0; i < N; ++i) {
+    pos[i].x = vort[i].x;
+    pos[i].y = vort[i].y;
+  }
+  fptr(pos, vort, vel, N);
 
   if (cuda) cudaDeviceSynchronize();
   double start = omp_get_wtime();
   nvtxRangePushA(label);
   for (int i = 0; i < NUM_REPS; ++i) {
-    fptr(vort, vort, gam, vel, N);
+    fptr(pos, vort, vel, N);
   }
   if (cuda) cudaDeviceSynchronize();
   nvtxRangePop();
@@ -116,7 +120,7 @@ void time_induced_vel(const char *label,
 
   // Check the answer: return time only if answer is correct.
   float2 *validation = (float2 *) malloc(N * sizeof(float2));
-  induced_vel_reference(vort, vort, gam, validation, N);
+  induced_vel_reference(pos, vort, validation, N);
   for (int i = 0; i < N; ++i) {
     if (!close(vel[i], validation[i])) {
       printf("%s: Error: velocity is incorrect at index %d\n", label, i);
@@ -126,6 +130,7 @@ void time_induced_vel(const char *label,
     }
   }
   free(validation);
+  cudaFree(pos);
 
   double time = (end - start) / ((double) NUM_REPS);
   double Mflops = (double) (6 * N * N) / (1000 * 1000 * 1000 * time);
@@ -135,29 +140,27 @@ void time_induced_vel(const char *label,
 
 int main() {
   const int N = 8192;
-  float2 *vort = NULL;
+  float4 *vort = NULL;
   float2 *vel = NULL;
-  float *gam = NULL;
 
   cudaMallocManaged(&vort, N * sizeof(*vort));
   cudaMallocManaged(&vel, N * sizeof(*vel));
-  cudaMallocManaged(&gam, N * sizeof(*gam));
   cudaCheckError();
 
   // initialize vortex positions and strengths to random values
   for (int i = 0; i < N; ++i) {
     vort[i].x = rand() / (float) RAND_MAX;
     vort[i].y = rand() / (float) RAND_MAX;
-    gam[i] = rand() / (float) RAND_MAX;
+    vort[i].z = rand() / (float) RAND_MAX;
+    vort[i].w = 0.;
   }
   memset(vel, 0, N * sizeof(float2));
 
-  time_induced_vel((char *)"CPU", induced_vel_reference, vort, gam, vel, N, false);
-  time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, gam, vel, N, false);
-  time_induced_vel((char *)"GPU", induced_vel_gpu, vort, gam, vel, N, true);
+  time_induced_vel((char *)"CPU", induced_vel_reference, vort, vel, N, false);
+  time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, vel, N, false);
+  time_induced_vel((char *)"GPU", induced_vel_gpu, vort, vel, N, true);
 
   cudaFree(vort);
   cudaFree(vel);
-  cudaFree(gam);
   return 0;
 }
