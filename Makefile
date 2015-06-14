@@ -1,4 +1,4 @@
 all: nbody
 
 % : %.cu
-	nvcc $< -O3 -o $@ -g -G -lineinfo -Xcompiler -fopenmp -lnvToolsExt
+	nvcc $< -O3 -o $@ -lineinfo -Xcompiler -fopenmp -arch=sm_35 -lnvToolsExt
