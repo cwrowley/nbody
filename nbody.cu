@@ -12,6 +12,7 @@
  }                                                               \
 }
 
+__device__ __host__
 inline float2 induced_velocity_single(float2 pos, float4 vort) {
   // vortex strength is vort.z
   const float eps = 1.e-6;
@@ -73,7 +74,7 @@ __global__ void induced_vel_kernel(const float2 * __restrict__ pos,
   vel_out[i] = vel;
 }
 
-const int TILE_SIZE = 128;
+const int TILE_SIZE = 32;
 
 __global__
 void induced_vel_kernel_smem(const float2 *pos,
@@ -109,6 +110,33 @@ void induced_vel_kernel_smem(const float2 *pos,
   vel_out[i] = vel;
 }
 
+__global__
+void induced_vel_kernel_smem2(const float2 *pos,
+                     const float4 *vort,
+                     float2 *vel_out,
+                     const int N) {
+  // __shared__ float4 smem[TILE_SIZE];
+  // __shared__ float2 svel[TILE_SIZE];
+  // const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  // const int t = threadIdx.x;
+
+  // const float eps = 1.e-6;
+
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
+    // i indexes position
+    float2 vel = {0.0, 0.0};
+    float2 p = pos[i];
+    for (int j = blockIdx.y * blockDim.y + threadIdx.y; j < N; j += blockDim.y * gridDim.y) {
+      // j indexes vortices
+      float2 v = induced_velocity_single(p, vort[j]);
+      vel.x += v.x;
+      vel.y += v.y;
+    }
+    atomicAdd(&vel_out[i].x, vel.x);
+    atomicAdd(&vel_out[i].y, vel.y);
+  }
+}
+
 void induced_vel_gpu(const float2 *pos,
                      const float4 *vort,
                      float2 *vel,
@@ -119,6 +147,19 @@ void induced_vel_gpu(const float2 *pos,
   cudaCheckError();
 }
 
+void induced_vel_gpu2(const float2 *pos,
+                      const float4 *vort,
+                      float2 *vel,
+                      const int N) {
+  dim3 threads(TILE_SIZE,TILE_SIZE);
+  dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y - 1) / threads.y);
+  // dim3 threads(N, N);
+  // dim3 blocks(1, 1);
+  memset(vel, 0, N * sizeof(float2));
+  induced_vel_kernel_smem2<<<blocks, threads>>>(pos, vort, vel, N);
+  // induced_vel_kernel_smem2<<<1, 1>>>(pos, vort, vel, N);
+  cudaCheckError();
+}
 
 typedef void (*func_ptr)(const float2*, const float4*, float2*, const int);
 
@@ -179,10 +220,13 @@ void time_induced_vel(const char *label,
 
 int main() {
   // const int N = 8192;
-  const int N = 1<<15;
-  // const int N = 128;
+  const int N = 1<<13;
+  // const int N = 1024;
   float4 *vort = NULL;
   float2 *vel = NULL;
+
+  cudaSetDevice(1);
+  cudaCheckError();
 
   cudaMallocManaged(&vort, N * sizeof(*vort));
   cudaMallocManaged(&vel, N * sizeof(*vel));
@@ -200,8 +244,10 @@ int main() {
   time_induced_vel((char *)"CPU", induced_vel_reference, vort, vel, N, false);
   time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, vel, N, false);
   time_induced_vel((char *)"GPU", induced_vel_gpu, vort, vel, N, true);
+  time_induced_vel((char *)"GPU v2", induced_vel_gpu2, vort, vel, N, true);
 
   cudaFree(vort);
   cudaFree(vel);
+  cudaDeviceReset();
   return 0;
 }
