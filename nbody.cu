@@ -16,9 +16,10 @@ __device__ __host__
 inline float2 induced_velocity_single(float2 pos, float4 vort) {
   // vortex strength is vort.z
   const float eps = 1.e-6;
-  const float2 r = {pos.x - vort.x, pos.y - vort.y};
-  float rsq = r.x * r.x + r.y * r.y + eps;
-  float2 vel = {vort.z * r.y / rsq, -vort.z * r.x / rsq};
+  float dx = pos.x - vort.x;
+  float dy = pos.y - vort.y;
+  float fac = vort.z / (dx * dx + dy * dy + eps);
+  float2 vel = {dy * fac, -dx * fac};
   return vel;
 }
 
@@ -62,19 +63,14 @@ __global__ void induced_vel_kernel(const float2 * __restrict__ pos,
   const float2 p = pos[i];
   float2 vel = {0.,0.};
   for (int j = 0; j < N; ++j) {
-    const float eps = 1.e-6;
-    float dx = p.x - vort[j].x;
-    float dy = p.y - vort[j].y;
-    // const float2 r = {p.x - vort[j].x, p.y - vort[j].y};
-    // float fac = vort[j].z / (r.x * r.x + r.y * r.y + eps);
-    float fac = vort[j].z / (dx * dx + dy * dy + eps);
-    vel.x +=  dy * fac;
-    vel.y += -dx * fac;
+    float2 v = induced_velocity_single(p, vort[j]);
+    vel.x += v.x;
+    vel.y += v.y;
   }
   vel_out[i] = vel;
 }
 
-const int TILE_SIZE = 32;
+const int TILE_SIZE = 128;
 
 __global__
 void induced_vel_kernel_smem(const float2 *pos,
@@ -87,7 +83,6 @@ void induced_vel_kernel_smem(const float2 *pos,
 
   const float2 p = pos[i];
   float2 vel = {0.,0.};
-  const float eps = 1.e-6;
 
   for (int j = t; j < N; j += TILE_SIZE) {
     // load a chunk of vortices into shared memory
@@ -96,13 +91,9 @@ void induced_vel_kernel_smem(const float2 *pos,
 
     // compute contributions from each vortex in the chunk
     for (int k = 0; k < TILE_SIZE && t + blockIdx.x * TILE_SIZE < N; ++k) {
-      // const float2 r = {p.x - smem[k].x, p.y - smem[k].y};
-      // float fac = smem[k].z / (r.x * r.x + r.y * r.y + eps);
-      float dx = p.x - smem[k].x;
-      float dy = p.y - smem[k].y;
-      float fac = smem[k].z / (dx * dx + dy * dy + eps);
-      vel.x +=  dy * fac;
-      vel.y += -dx * fac;
+      float2 v = induced_velocity_single(p, smem[k]);
+      vel.x += v.x;
+      vel.y += v.y;
     }
     __syncthreads();
   }
@@ -111,22 +102,23 @@ void induced_vel_kernel_smem(const float2 *pos,
 }
 
 __global__
-void induced_vel_kernel_smem2(const float2 *pos,
-                     const float4 *vort,
-                     float2 *vel_out,
-                     const int N) {
-  // __shared__ float4 smem[TILE_SIZE];
-  // __shared__ float2 svel[TILE_SIZE];
-  // const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  // const int t = threadIdx.x;
+void induced_vel_kernel2(const float2 * __restrict__ pos,
+                              const float4 * __restrict__ vort,
+                              float2 *vel_out,
+                              const int N) {
+  // __shared__ float2 smem[TILE_SIZE];
 
-  // const float eps = 1.e-6;
-
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
+  for (int i = blockIdx.y * blockDim.y + threadIdx.y; i < N; i += blockDim.y * gridDim.y) {
     // i indexes position
+    // load positions into shared memory
+    // smem[threadIdx.x] = pos[blockIdx.y * blockDim.y + threadIdx.x];
+    // __syncthreads();
+
     float2 vel = {0.0, 0.0};
     float2 p = pos[i];
-    for (int j = blockIdx.y * blockDim.y + threadIdx.y; j < N; j += blockDim.y * gridDim.y) {
+    // float2 p = smem[threadIdx.y];
+
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < N; j += blockDim.x * gridDim.x) {
       // j indexes vortices
       float2 v = induced_velocity_single(p, vort[j]);
       vel.x += v.x;
@@ -134,6 +126,7 @@ void induced_vel_kernel_smem2(const float2 *pos,
     }
     atomicAdd(&vel_out[i].x, vel.x);
     atomicAdd(&vel_out[i].y, vel.y);
+    // __syncthreads();
   }
 }
 
@@ -151,13 +144,53 @@ void induced_vel_gpu2(const float2 *pos,
                       const float4 *vort,
                       float2 *vel,
                       const int N) {
-  dim3 threads(TILE_SIZE,TILE_SIZE);
-  dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y - 1) / threads.y);
+  dim3 threads(32, 32);
+  dim3 blocks(1, (N + threads.y - 1) / threads.y);
   // dim3 threads(N, N);
   // dim3 blocks(1, 1);
   memset(vel, 0, N * sizeof(float2));
-  induced_vel_kernel_smem2<<<blocks, threads>>>(pos, vort, vel, N);
-  // induced_vel_kernel_smem2<<<1, 1>>>(pos, vort, vel, N);
+  induced_vel_kernel2<<<blocks, threads>>>(pos, vort, vel, N);
+  cudaCheckError();
+}
+
+const int THREADS_X = 8;
+const int NUM_ELEMS_PER_THREAD = 32 / THREADS_X;
+
+__global__
+void induced_vel_kernel3(const float2 * __restrict__ pos,
+                         const float4 * __restrict__ vort,
+                         float2 *vel_out,
+                         const int N) {
+  const float eps = 1.e-6;
+
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  int j = blockIdx.x * blockDim.x * NUM_ELEMS_PER_THREAD + threadIdx.x;
+
+  float2 vel = {0.0, 0.0};
+  float2 p = pos[i];
+
+  #pragma unroll
+  for (int k = 0; k < NUM_ELEMS_PER_THREAD; ++k) {
+    // j indexes vortices
+    float4 v = vort[j + k * THREADS_X];
+    float dx = p.x - v.x;
+    float dy = p.y - v.y;
+    float fac = v.z / (dx * dx + dy * dy + eps);
+    vel.x +=  dy * fac;
+    vel.y += -dx * fac;
+  }
+  atomicAdd(&vel_out[i].x, vel.x);
+  atomicAdd(&vel_out[i].y, vel.y);
+}
+
+void induced_vel_gpu3(const float2 *pos,
+                      const float4 *vort,
+                      float2 *vel,
+                      const int N) {
+  dim3 threads(THREADS_X, 32);
+  dim3 blocks((N + 31 - 1) / 32, (N + threads.y - 1) / threads.y);
+  memset(vel, 0, N * sizeof(float2));
+  induced_vel_kernel3<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
 
@@ -241,10 +274,12 @@ int main() {
   }
   memset(vel, 0, N * sizeof(float2));
 
+  printf("N = %d\n", N);
   time_induced_vel((char *)"CPU", induced_vel_reference, vort, vel, N, false);
   time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, vel, N, false);
   time_induced_vel((char *)"GPU", induced_vel_gpu, vort, vel, N, true);
   time_induced_vel((char *)"GPU v2", induced_vel_gpu2, vort, vel, N, true);
+  time_induced_vel((char *)"GPU v3", induced_vel_gpu3, vort, vel, N, true);
 
   cudaFree(vort);
   cudaFree(vel);
