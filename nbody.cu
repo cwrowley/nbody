@@ -101,6 +101,16 @@ void induced_vel_kernel_smem(const float2 *pos,
   vel_out[i] = vel;
 }
 
+void induced_vel_gpu(const float2 *pos,
+                     const float4 *vort,
+                     float2 *vel,
+                     const int N) {
+  dim3 threads(TILE_SIZE);
+  dim3 blocks((N + threads.x - 1)/threads.x);
+  induced_vel_kernel_smem<<<blocks, threads>>>(pos, vort, vel, N);
+  cudaCheckError();
+}
+
 __global__
 void induced_vel_kernel2(const float2 * __restrict__ pos,
                               const float4 * __restrict__ vort,
@@ -130,24 +140,15 @@ void induced_vel_kernel2(const float2 * __restrict__ pos,
   }
 }
 
-void induced_vel_gpu(const float2 *pos,
-                     const float4 *vort,
-                     float2 *vel,
-                     const int N) {
-  dim3 threads(TILE_SIZE);
-  dim3 blocks((N + threads.x - 1)/threads.x);
-  induced_vel_kernel_smem<<<blocks, threads>>>(pos, vort, vel, N);
-  cudaCheckError();
-}
+const int THREADS_PER_POS = 32;
+const int NUM_POS = 32;
 
 void induced_vel_gpu2(const float2 *pos,
                       const float4 *vort,
                       float2 *vel,
                       const int N) {
-  dim3 threads(32, 32);
+  dim3 threads(THREADS_PER_POS, NUM_POS);
   dim3 blocks(1, (N + threads.y - 1) / threads.y);
-  // dim3 threads(N, N);
-  // dim3 blocks(1, 1);
   memset(vel, 0, N * sizeof(float2));
   induced_vel_kernel2<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
@@ -191,6 +192,112 @@ void induced_vel_gpu3(const float2 *pos,
   dim3 blocks((N + 31 - 1) / 32, (N + threads.y - 1) / threads.y);
   memset(vel, 0, N * sizeof(float2));
   induced_vel_kernel3<<<blocks, threads>>>(pos, vort, vel, N);
+  cudaCheckError();
+}
+
+__global__
+void induced_vel_kernel4(const float2 * __restrict__ pos,
+                              const float4 * __restrict__ vort,
+                              float2 *vel_out,
+                              const int N) {
+  // Like version 2, but use privatized memory for sums within a thread block
+  // then do a single atomic add to global memory, for each row of the block
+  __shared__ float2 smem[NUM_POS];
+  const float2 zero = {0., 0.};
+
+  for (int i = blockIdx.y * blockDim.y + threadIdx.y; i < N; i += blockDim.y * gridDim.y) {
+    // i indexes position
+
+    // zero shared memory for private sum
+    smem[threadIdx.y] = zero;
+    __syncthreads();
+
+    float2 vel = {0.0, 0.0};
+    float2 p = pos[i];
+
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < N; j += blockDim.x * gridDim.x) {
+      // j indexes vortices
+      float2 v = induced_velocity_single(p, vort[j]);
+      vel.x += v.x;
+      vel.y += v.y;
+    }
+    atomicAdd(&smem[threadIdx.y].x, vel.x);
+    atomicAdd(&smem[threadIdx.y].y, vel.y);
+    // __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(&vel_out[i].x, smem[threadIdx.y].x);
+      atomicAdd(&vel_out[i].y, smem[threadIdx.y].y);
+    }
+    // __syncthreads();
+  }
+}
+
+void induced_vel_gpu4(const float2 *pos,
+                      const float4 *vort,
+                      float2 *vel,
+                      const int N) {
+  dim3 threads(THREADS_PER_POS, NUM_POS);
+  /* dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y - 1) / threads.y); */
+  dim3 blocks(1, (N + threads.y - 1) / threads.y);
+  memset(vel, 0, N * sizeof(float2));
+  induced_vel_kernel4<<<blocks, threads>>>(pos, vort, vel, N);
+  cudaCheckError();
+}
+
+__global__
+void induced_vel_kernel5(const float2 * __restrict__ pos,
+                              const float4 * __restrict__ vort,
+                              float2 *vel_out,
+                              const int N) {
+  // Like version 4, but keep sums in shared memory array and do reduction
+  // instead of atomic adds.
+  // Then do a single atomic add into global memory.
+  __shared__ float2 smem[NUM_POS][THREADS_PER_POS];
+  const float2 zero = {0., 0.};
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+
+  for (int i = blockIdx.y * blockDim.y + ty; i < N; i += blockDim.y * gridDim.y) {
+    // i indexes position
+
+    // zero shared memory for private sum
+    smem[ty][tx] = zero;
+    __syncthreads();
+
+    float2 vel = {0.0, 0.0};
+    float2 p = pos[i];
+
+    for (int j = blockIdx.x * blockDim.x + tx; j < N; j += blockDim.x * gridDim.x) {
+      // j indexes vortices
+      float2 v = induced_velocity_single(p, vort[j]);
+      vel.x += v.x;
+      vel.y += v.y;
+    }
+    smem[ty][tx] = vel;
+
+    // compute total of each row in smem
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      __syncthreads();
+      if (tx < stride) {
+        smem[ty][tx].x += smem[ty][tx + stride].x;
+        smem[ty][tx].y += smem[ty][tx + stride].y;
+      }
+    }
+    if (tx == 0) {
+      vel_out[i] = smem[ty][0];
+    }
+  }
+}
+
+void induced_vel_gpu5(const float2 *pos,
+                      const float4 *vort,
+                      float2 *vel,
+                      const int N) {
+  dim3 threads(THREADS_PER_POS, NUM_POS);
+  /* dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y - 1) / threads.y); */
+  dim3 blocks(1, (N + threads.y - 1) / threads.y);
+  memset(vel, 0, N * sizeof(float2));
+  induced_vel_kernel5<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
 
@@ -253,36 +360,42 @@ void time_induced_vel(const char *label,
 
 int main() {
   // const int N = 8192;
-  const int N = 1<<13;
-  // const int N = 1024;
   float4 *vort = NULL;
   float2 *vel = NULL;
 
   cudaSetDevice(1);
   cudaCheckError();
 
-  cudaMallocManaged(&vort, N * sizeof(*vort));
-  cudaMallocManaged(&vel, N * sizeof(*vel));
-  cudaCheckError();
+  const int min_exp = 13;
+  const int max_exp = 13;
 
-  // initialize vortex positions and strengths to random values
-  for (int i = 0; i < N; ++i) {
-    vort[i].x = rand() / (float) RAND_MAX;
-    vort[i].y = rand() / (float) RAND_MAX;
-    vort[i].z = rand() / (float) RAND_MAX;
-    vort[i].w = 0.;
+  for (int N = 1<<min_exp; N < (1<<max_exp) + 1; N <<= 1) {
+    cudaMallocManaged(&vort, N * sizeof(*vort));
+    cudaMallocManaged(&vel, N * sizeof(*vel));
+    cudaCheckError();
+
+    // initialize vortex positions and strengths to random values
+    for (int i = 0; i < N; ++i) {
+      vort[i].x = rand() / (float) RAND_MAX;
+      vort[i].y = rand() / (float) RAND_MAX;
+      vort[i].z = rand() / (float) RAND_MAX;
+      vort[i].w = 0.;
+    }
+    memset(vel, 0, N * sizeof(float2));
+
+    printf("N = %d\n", N);
+    time_induced_vel((char *)"CPU", induced_vel_reference, vort, vel, N, false);
+    time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, vel, N, false);
+    time_induced_vel((char *)"GPU", induced_vel_gpu, vort, vel, N, true);
+    time_induced_vel((char *)"GPU v2", induced_vel_gpu2, vort, vel, N, true);
+    time_induced_vel((char *)"GPU v3", induced_vel_gpu3, vort, vel, N, true);
+    time_induced_vel((char *)"GPU v4", induced_vel_gpu4, vort, vel, N, true);
+    time_induced_vel((char *)"GPU v5", induced_vel_gpu5, vort, vel, N, true);
+    printf("  =====\n");
+
+    cudaFree(vort);
+    cudaFree(vel);
   }
-  memset(vel, 0, N * sizeof(float2));
-
-  printf("N = %d\n", N);
-  time_induced_vel((char *)"CPU", induced_vel_reference, vort, vel, N, false);
-  time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, vel, N, false);
-  time_induced_vel((char *)"GPU", induced_vel_gpu, vort, vel, N, true);
-  time_induced_vel((char *)"GPU v2", induced_vel_gpu2, vort, vel, N, true);
-  time_induced_vel((char *)"GPU v3", induced_vel_gpu3, vort, vel, N, true);
-
-  cudaFree(vort);
-  cudaFree(vel);
   cudaDeviceReset();
   return 0;
 }
