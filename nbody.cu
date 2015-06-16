@@ -251,41 +251,71 @@ void induced_vel_kernel5(const float2 * __restrict__ pos,
                               const int N) {
   // Like version 4, but keep sums in shared memory array and do reduction
   // instead of atomic adds.
-  // Then do a single atomic add into global memory.
-  __shared__ float2 smem[NUM_POS][THREADS_PER_POS];
-  const float2 zero = {0., 0.};
+  // Then do a single copy into global memory.
+  __shared__ float2 svel[NUM_POS][THREADS_PER_POS];
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
 
-  for (int i = blockIdx.y * blockDim.y + ty; i < N; i += blockDim.y * gridDim.y) {
-    // i indexes position
+  const int i = blockIdx.y * blockDim.y + ty;   // i indexes position
 
-    // zero shared memory for private sum
-    smem[ty][tx] = zero;
+  float2 vel = {0.0, 0.0};
+  float2 p = pos[i];
+
+  for (int j = blockIdx.x * blockDim.x + tx; j < N; j += blockDim.x * gridDim.x) {
+    // j indexes vortices
+    float2 v = induced_velocity_single(p, vort[j]);
+    vel.x += v.x;
+    vel.y += v.y;
+  }
+  svel[ty][tx] = vel;
+
+  // compute total of each row in svel
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
     __syncthreads();
-
-    float2 vel = {0.0, 0.0};
-    float2 p = pos[i];
-
-    for (int j = blockIdx.x * blockDim.x + tx; j < N; j += blockDim.x * gridDim.x) {
-      // j indexes vortices
-      float2 v = induced_velocity_single(p, vort[j]);
-      vel.x += v.x;
-      vel.y += v.y;
+    if (tx < stride) {
+      svel[ty][tx].x += svel[ty][tx + stride].x;
+      svel[ty][tx].y += svel[ty][tx + stride].y;
     }
-    smem[ty][tx] = vel;
+  }
+  /*
+  // unroll manually  - this is a little slower on my workstation!
+  // stride = 16
+  __syncthreads();
+  if (tx < 16) {
+    svel[ty][tx].x += svel[ty][tx + 16].x;
+    svel[ty][tx].y += svel[ty][tx + 16].y;
+  }
+  // stride = 8
+  __syncthreads();
+  if (tx < 8) {
+    svel[ty][tx].x += svel[ty][tx + 8].x;
+    svel[ty][tx].y += svel[ty][tx + 8].y;
+  }
+  // stride = 4
+  __syncthreads();
+  if (tx < 4) {
+    svel[ty][tx].x += svel[ty][tx + 4].x;
+    svel[ty][tx].y += svel[ty][tx + 4].y;
+  }
+  // stride = 2
+  __syncthreads();
+  if (tx < 2) {
+    svel[ty][tx].x += svel[ty][tx + 2].x;
+    svel[ty][tx].y += svel[ty][tx + 2].y;
+  }
+  // stride = 1
+  __syncthreads();
+  if (tx < 1) {
+    svel[ty][tx].x += svel[ty][tx + 1].x;
+    svel[ty][tx].y += svel[ty][tx + 1].y;
+  }
+  */
 
-    // compute total of each row in smem
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-      __syncthreads();
-      if (tx < stride) {
-        smem[ty][tx].x += smem[ty][tx + stride].x;
-        smem[ty][tx].y += smem[ty][tx + stride].y;
-      }
-    }
-    if (tx == 0) {
-      vel_out[i] = smem[ty][0];
-    }
+  __syncthreads();
+  if (ty == 0) {
+    // index using tx so that global write is coalesced
+    // NOTE: thread block must be square (eg 32 x 32) for this to work
+    vel_out[blockIdx.y * blockDim.y + tx] = svel[tx][0];
   }
 }
 
@@ -366,7 +396,7 @@ int main() {
   cudaSetDevice(1);
   cudaCheckError();
 
-  const int min_exp = 13;
+  const int min_exp = 8;
   const int max_exp = 13;
 
   for (int N = 1<<min_exp; N < (1<<max_exp) + 1; N <<= 1) {
