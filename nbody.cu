@@ -149,7 +149,7 @@ void induced_vel_gpu2(const float2 *pos,
                       const int N) {
   dim3 threads(THREADS_PER_POS, NUM_POS);
   dim3 blocks(1, (N + threads.y - 1) / threads.y);
-  memset(vel, 0, N * sizeof(float2));
+  cudaMemset(vel, 0, N * sizeof(float2));
   induced_vel_kernel2<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
@@ -190,7 +190,7 @@ void induced_vel_gpu3(const float2 *pos,
                       const int N) {
   dim3 threads(THREADS_X, 32);
   dim3 blocks((N + 31 - 1) / 32, (N + threads.y - 1) / threads.y);
-  memset(vel, 0, N * sizeof(float2));
+  cudaMemset(vel, 0, N * sizeof(float2));
   induced_vel_kernel3<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
@@ -239,7 +239,7 @@ void induced_vel_gpu4(const float2 *pos,
   dim3 threads(THREADS_PER_POS, NUM_POS);
   /* dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y - 1) / threads.y); */
   dim3 blocks(1, (N + threads.y - 1) / threads.y);
-  memset(vel, 0, N * sizeof(float2));
+  cudaMemset(vel, 0, N * sizeof(float2));
   induced_vel_kernel4<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
@@ -326,14 +326,13 @@ void induced_vel_gpu5(const float2 *pos,
   dim3 threads(THREADS_PER_POS, NUM_POS);
   /* dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y - 1) / threads.y); */
   dim3 blocks(1, (N + threads.y - 1) / threads.y);
-  memset(vel, 0, N * sizeof(float2));
   induced_vel_kernel5<<<blocks, threads>>>(pos, vort, vel, N);
   cudaCheckError();
 }
 
 typedef void (*func_ptr)(const float2*, const float4*, float2*, const int);
 
-const int NUM_REPS = 1;
+const int NUM_REPS = 5;
 
 inline bool close(float2 a, float2 b) {
   const float rel_tol = 1.e-6;
@@ -341,7 +340,7 @@ inline bool close(float2 a, float2 b) {
     rel_tol * fabs(a.x * a.x + a.y * a.y);
 }
 
-void time_induced_vel(const char *label,
+double time_induced_vel(const char *label,
                       func_ptr fptr,
                       const float4 *vort,
                       float2 *vel,
@@ -376,15 +375,16 @@ void time_induced_vel(const char *label,
       printf("%s: Error: velocity is incorrect at index %d\n", label, i);
       printf("  expected (%f, %f)\n       got (%f, %f)\n",
              validation[i].x, validation[i].y, vel[i].x, vel[i].y);
-      return;
+      return 0.;
     }
   }
   free(validation);
   cudaFree(pos);
 
   double time = (end - start) / ((double) NUM_REPS);
-  double Mflops = (double) (6. * N * N) / (1000 * 1000 * 1000 * time);
-  printf("%s: %f GFlops\n", label, Mflops);
+  double Gflops = (double) (6. * N * N) / (1000 * 1000 * 1000 * time);
+  // printf("%s: %f GFlops\n", label, Gflops);
+  return Gflops;
 }
 
 
@@ -392,14 +392,37 @@ int main() {
   // const int N = 8192;
   float4 *vort = NULL;
   float2 *vel = NULL;
+  const int num_funcs = 7;
+  func_ptr funcs[num_funcs] = {induced_vel_reference,
+                               induced_vel_omp,
+                               induced_vel_gpu,
+                               induced_vel_gpu2,
+                               induced_vel_gpu3,
+                               induced_vel_gpu4,
+                               induced_vel_gpu5};
+  const char *names[num_funcs] = {"   CPU",
+                                  "CPU + OMP",
+                                  "   GPU",
+                                  "  GPU v2",
+                                  "  GPU v3",
+                                  "  GPU v4",
+                                  "  GPU v5"};
+  const bool gpu[num_funcs] = {false,
+                               false,
+                               true,
+                               true,
+                               true,
+                               true,
+                               true};
+  const int min_exp = 7;
+  const int max_exp = 14;
+  float times[max_exp - min_exp + 1][num_funcs];
 
   cudaSetDevice(1);
   cudaCheckError();
 
-  const int min_exp = 8;
-  const int max_exp = 13;
-
-  for (int N = 1<<min_exp; N < (1<<max_exp) + 1; N <<= 1) {
+  for (int j = 0; j < (max_exp - min_exp + 1); ++j) {
+    const int N = 1 << (min_exp + j);
     cudaMallocManaged(&vort, N * sizeof(*vort));
     cudaMallocManaged(&vel, N * sizeof(*vel));
     cudaCheckError();
@@ -414,18 +437,29 @@ int main() {
     memset(vel, 0, N * sizeof(float2));
 
     printf("N = %d\n", N);
-    time_induced_vel((char *)"CPU", induced_vel_reference, vort, vel, N, false);
-    time_induced_vel((char *)"CPU + OMP", induced_vel_omp, vort, vel, N, false);
-    time_induced_vel((char *)"GPU", induced_vel_gpu, vort, vel, N, true);
-    time_induced_vel((char *)"GPU v2", induced_vel_gpu2, vort, vel, N, true);
-    time_induced_vel((char *)"GPU v3", induced_vel_gpu3, vort, vel, N, true);
-    time_induced_vel((char *)"GPU v4", induced_vel_gpu4, vort, vel, N, true);
-    time_induced_vel((char *)"GPU v5", induced_vel_gpu5, vort, vel, N, true);
-    printf("  =====\n");
+    for (int k = 0; k < num_funcs; ++k) {
+      times[j][k] = time_induced_vel(names[k], funcs[k], vort, vel, N, gpu[k]);
+    }
 
     cudaFree(vort);
     cudaFree(vel);
   }
   cudaDeviceReset();
+
+  // print results
+  printf("   N  ");
+  for (int k = 0; k < num_funcs; ++k) {
+    printf("|%-10s", names[k]);
+  }
+  printf("\n------");
+  for (int k = 0; k < num_funcs; ++k) printf("+----------");
+  printf("\n");
+  for (int j = 0; j < (max_exp - min_exp + 1); ++j) {
+    printf("%5d ", 1 << (j + min_exp));
+    for (int k = 0; k < num_funcs; ++k) {
+      printf("|%9.4f ", times[j][k]);
+    }
+    printf("\n");
+  }
   return 0;
 }
